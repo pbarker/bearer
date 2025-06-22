@@ -27,11 +27,12 @@ def extract_forward_source(model):
 
 def extract_assign_lines(model):
     source = inspect.getsource(model.__class__.forward)
+    source = textwrap.dedent(source)
     atok = asttokens.ASTTokens(source, parse=True)
     line_map = {}
 
     for node in ast.walk(atok.tree):
-        if isinstance(node, ast.Assign):
+        if isinstance(node, (ast.Assign, ast.Return)):
             line_text = atok.get_text(node).strip()
             line_map[node.lineno] = line_text
 
@@ -87,7 +88,6 @@ def trace_and_generate_llm_data(
             output_info = {
                 "shape": list(output.shape),
                 "dtype": str(output.dtype),
-                "values": output.detach().cpu().numpy().round(3).tolist(),
             }
 
         graph_state = {}
@@ -95,32 +95,71 @@ def trace_and_generate_llm_data(
             if isinstance(v, torch.Tensor):
                 graph_state[k] = {"shape": list(v.shape), "dtype": str(v.dtype)}
 
-        lineno = None
-        for ln, code in line_map.items():
-            if str(node.target) in code:
-                lineno = ln
-                break
+        # Better line mapping logic
+        current_line = "<unknown>"
+        if node.op == "placeholder":
+            current_line = f"# Input parameter: {node.name}"
+        elif node.op == "output":
+            # Find return statement
+            for ln, code in line_map.items():
+                if "return" in code:
+                    current_line = code
+                    break
+            if current_line == "<unknown>":
+                current_line = "# Return statement"
+        else:
+            # For call_module, call_function, call_method - find best matching line
+            target_str = str(node.target)
+            best_match = None
+            best_line = None
 
-        current_line = (
-            source_lines[lineno - 1]
-            if lineno and 0 <= lineno - 1 < len(source_lines)
-            else "<unknown>"
-        )
+            for ln, code in line_map.items():
+                # Look for the target in the code line
+                if target_str in code:
+                    # Prefer assignment lines, but also accept return statements
+                    if (
+                        "=" in code and not code.strip().startswith("#")
+                    ) or "return" in code:
+                        best_match = code
+                        best_line = ln
+                        break
+                    elif best_match is None:
+                        best_match = code
+                        best_line = ln
+
+            if best_match:
+                current_line = best_match
+
+        # Create more accurate prompt based on node type
+        if node.op == "placeholder":
+            operation_desc = f"Input tensor '{node.name}' is provided to the model"
+            question = f"What are the shape and dtype of input '{node.name}'?"
+        elif node.op == "output":
+            operation_desc = f"Final output is returned: {current_line.strip()}"
+            question = "What are the shape and dtype of the final output?"
+        else:
+            operation_desc = f"Executing: {current_line.strip()}"
+            question = f"What are the shape and dtype after executing this operation?"
 
         prompt = (
             f"# Model forward pass:\n\n"
             f"{source_code}\n\n"
-            f"# Current line:\n{current_line.strip()}\n\n"
-            f"# Executed node: {node.op}: {node.name}\n\n"
-            f"# Graph state:\n"
+            f"# Current operation:\n{operation_desc}\n\n"
+            f"# Graph state before this operation:\n"
             + "\n".join(
                 f"- {k}: shape={v['shape']}, dtype={v['dtype']}"
                 for k, v in graph_state.items()
+                if k
+                != node.name  # Don't include current node's output in "before" state
             )
-            + "\n\nWhat is the output of this line?"
+            + f"\n\n{question}"
         )
 
-        response = f"Output: shape={output_info.get('shape')}, dtype={output_info.get('dtype')}"
+        # Create more descriptive response
+        if output_info:
+            response = f"Shape: {output_info['shape']}, dtype: {output_info['dtype']}"
+        else:
+            response = "No tensor output (this operation doesn't produce a tensor)"
 
         examples.append(
             {
